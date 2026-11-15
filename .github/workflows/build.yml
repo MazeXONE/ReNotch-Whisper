@@ -1,0 +1,121 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  VULKAN_SDK_VERSION: "1.4.309.0"
+
+jobs:
+  build:
+    name: windows-x64 (${{ matrix.backend }})
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cpu, vulkan]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Vulkan SDK
+        if: matrix.backend == 'vulkan'
+        shell: pwsh
+        run: |
+          $v = $env:VULKAN_SDK_VERSION
+          curl.exe -sSfL -o "$env:RUNNER_TEMP\vulkan-sdk.exe" "https://sdk.lunarg.com/sdk/download/$v/windows/VulkanSDK-$v-Installer.exe"
+          & "$env:RUNNER_TEMP\vulkan-sdk.exe" --accept-licenses --default-answer --confirm-command install | Out-Null
+          "VULKAN_SDK=C:\VulkanSDK\$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "C:\VulkanSDK\$v\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $vk = if ('${{ matrix.backend }}' -eq 'vulkan') { 'ON' } else { 'OFF' }
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DRENOTCH_WHISPER_VULKAN=$vk
+
+      - name: Build
+        run: cmake --build build --config Release --target renotch-whisper -j 4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Check the exe has no extra DLL dependencies
+        shell: pwsh
+        run: |
+          $exe = "build\Release\renotch-whisper-${{ matrix.backend }}.exe"
+          $deps = dumpbin /dependents $exe | Select-String '\.dll' | ForEach-Object { $_.ToString().Trim().ToLower() }
+          $deps
+          $bad = $deps | Where-Object { $_ -match 'vcruntime|msvcp|vcomp|ucrtbase|api-ms-win-crt|ggml|whisper' }
+          if ($bad) { throw "Unexpected runtime dependency: $bad" }
+          (Get-Item $exe).Length / 1MB
+
+      - name: Smoke test (version)
+        shell: pwsh
+        run: |
+          $exe = "build\Release\renotch-whisper-${{ matrix.backend }}.exe"
+          $out = & $exe --version
+          $out
+          if ($out -notmatch '"backend":"${{ matrix.backend }}"') { throw "bad version output" }
+          if ('${{ github.ref_type }}' -eq 'tag') {
+            $want = '${{ github.ref_name }}'.TrimStart('v')
+            if ($out -notmatch ('"version":"' + [regex]::Escape($want) + '"')) { throw "CMake project VERSION does not match tag $want" }
+          }
+
+      - name: Smoke test (real transcription, tiny model)
+        # The CI runner has no GPU, so the Vulkan build may not start there; CPU must pass.
+        continue-on-error: ${{ matrix.backend == 'vulkan' }}
+        shell: pwsh
+        run: |
+          curl.exe -sSfL -o "$env:RUNNER_TEMP\ggml-tiny.bin" https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin
+          curl.exe -sSfL -o "$env:RUNNER_TEMP\jfk.wav" https://raw.githubusercontent.com/ggml-org/whisper.cpp/master/samples/jfk.wav
+          python -c "import wave,array,sys; w=wave.open(sys.argv[1]); a=array.array('h', w.readframes(w.getnframes())); open(sys.argv[2],'wb').write(array.array('f',[s/32768.0 for s in a]).tobytes())" "$env:RUNNER_TEMP\jfk.wav" "$env:RUNNER_TEMP\jfk.f32"
+          $model = ("$env:RUNNER_TEMP\ggml-tiny.bin") -replace '\\','\\'
+          $pcm = ("$env:RUNNER_TEMP\jfk.f32") -replace '\\','\\'
+          $req = "{`"cmd`":`"load`",`"model`":`"$model`",`"gpu`":true}`n{`"cmd`":`"transcribe`",`"pcm`":`"$pcm`",`"lang`":`"en`",`"prompt`":`"`",`"beam`":false}`n"
+          $out = $req | & "build\Release\renotch-whisper-${{ matrix.backend }}.exe"
+          $out
+          if (($out -join "`n") -notmatch '"text":"[^"]*country') { throw "transcription did not return the expected text" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: renotch-whisper-${{ matrix.backend }}
+          path: build/Release/renotch-whisper-${{ matrix.backend }}.exe
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum renotch-whisper-*.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ReNotch Whisper ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            dist/renotch-whisper-cpu.exe
+            dist/renotch-whisper-vulkan.exe
+            dist/SHA256SUMS.txt
+            LICENSE
+            THIRD_PARTY_NOTICES.md
