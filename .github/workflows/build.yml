@@ -11,7 +11,8 @@ permissions:
   contents: read
 
 env:
-  VULKAN_SDK_VERSION: "1.4.309.0"
+  # Same SDK as llama.cpp's Windows release; it ships the SPIRV-Headers CMake package ggml-vulkan needs.
+  VULKAN_SDK_VERSION: "1.4.357.0"
 
 jobs:
   build:
@@ -30,16 +31,18 @@ jobs:
         shell: pwsh
         run: |
           $v = $env:VULKAN_SDK_VERSION
-          curl.exe -sSfL -o "$env:RUNNER_TEMP\vulkan-sdk.exe" "https://sdk.lunarg.com/sdk/download/$v/windows/VulkanSDK-$v-Installer.exe"
+          curl.exe -sSfL -o "$env:RUNNER_TEMP\vulkan-sdk.exe" "https://sdk.lunarg.com/sdk/download/$v/windows/vulkansdk-windows-X64-$v.exe"
           & "$env:RUNNER_TEMP\vulkan-sdk.exe" --accept-licenses --default-answer --confirm-command install | Out-Null
-          "VULKAN_SDK=C:\VulkanSDK\$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "C:\VulkanSDK\$v\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          if (-not (Test-Path "C:\VulkanSDK\$v\bin\glslc.exe")) { throw "Vulkan SDK install failed" }
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$v"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$v\bin"
 
       - name: Configure
         shell: pwsh
         run: |
           $vk = if ('${{ matrix.backend }}' -eq 'vulkan') { 'ON' } else { 'OFF' }
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DRENOTCH_WHISPER_VULKAN=$vk
+          # Quoted: PowerShell passes a bare -DNAME=$var through literally, without expanding it.
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 "-DRENOTCH_WHISPER_VULKAN=$vk"
 
       - name: Build
         run: cmake --build build --config Release --target renotch-whisper -j 4
