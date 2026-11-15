@@ -282,7 +282,8 @@ struct Engine {
         if (!c) return false;
         ctx = c;
         model_path = path;
-        gpu = used_gpu;
+        // The CPU build has no GPU backend: use_gpu is accepted but runs on the CPU.
+        gpu = used_gpu && std::strcmp(RENOTCH_WHISPER_BACKEND, "cpu") != 0;
         return true;
     }
 };
